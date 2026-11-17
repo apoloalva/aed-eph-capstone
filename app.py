@@ -1,131 +1,161 @@
-import streamlit as st
+import os
+
 import pandas as pd
-import numpy as np
 import plotly.express as px
-from scipy.stats import chi2_contingency
-from pathlib import Path
+import streamlit as st
 
-st.set_page_config(page_title="AED EPH", layout="wide")
+st.set_page_config(page_title="EDA prepagas", layout="wide")
+st.title("Análisis exploratorio: planes de prepagas")
 
-# ---------- Configuración ----------
-CH08_LABELS = {
-    1: "Obra social",
-    2: "Prepaga/mutual/emergencia",
-    3: "Plan/seguro público",
-    4: "Sin cobertura",
-    12: "Obra social + prepaga",
-    13: "Obra social + público",
-    23: "Prepaga + público",
-    123: "Obra social + prepaga + público",
-}
-CATEGORICAS = ["REGION", "IV1", "IV12_3", "II7", "V5_01", "V15",
-               "CH04", "CH07", "NIVEL_ED", "ESTADO", "EMPLEO", "PP04A"]
-NUMERICAS = ["CH06", "IX_MEN10", "IPCF", "P47T"]
+RUTAS = [r"C:\Users\Apolo\Downloads\base_limpia.csv", "base_limpia.csv"]
 
-# ---------- Datos ----------
 
 @st.cache_data
-def cargar():
-    df = pd.read_parquet(Path(__file__).parent / "eph_limpio.parquet")
-    df["COBERTURA"] = df["CH08"].map(CH08_LABELS)
+def cargar(fuente):
+    df = pd.read_csv(fuente)
+    df["edad_media"] = (df["rango_etario_desde"] + df["rango_etario_hasta"]) / 2
     return df
 
-df_full = cargar()
 
-# ---------- Sidebar ----------
+# ---------- Carga ----------
+archivo = st.sidebar.file_uploader("Subir otro CSV (opcional)", type="csv")
+fuente = archivo or next((r for r in RUTAS if os.path.exists(r)), None)
+if fuente is None:
+    st.error("No encontré base_limpia.csv. Subilo desde la barra lateral.")
+    st.stop()
+df = cargar(fuente)
+
+# ---------- Filtros ----------
 st.sidebar.header("Filtros")
-regiones = st.sidebar.multiselect(
-    "Región", sorted(df_full["REGION"].dropna().unique()),
-    default=sorted(df_full["REGION"].dropna().unique()),
+prest = st.sidebar.multiselect(
+    "Prestadora", sorted(df["nombre_comercial"].unique()),
+    default=sorted(df["nombre_comercial"].unique()),
 )
-ponderar = st.sidebar.toggle("Ponderar por PONDERA", value=True)
+regiones = st.sidebar.multiselect("Región", sorted(df["region"].unique()))
+vmin, vmax = int(df["valor_capital"].min()), int(df["valor_capital"].max())
+rango_v = st.sidebar.slider("Valor cápita ($)", vmin, vmax, (vmin, vmax))
+log_y = st.sidebar.checkbox("Escala log en precios", value=False)
 
-df = df_full[df_full["REGION"].isin(regiones)].copy()
-df["_w"] = df["PONDERA"] if ponderar else 1
+dff = df[df["nombre_comercial"].isin(prest)]
+if regiones:
+    dff = dff[dff["region"].isin(regiones)]
+dff = dff[dff["valor_capital"].between(*rango_v)]
 
-st.title("AED - Cobertura de salud (EPH 1T 2026)")
-tabs = st.tabs(["Resumen", "Variable respuesta", "Numéricas",
-                "Categóricas vs Y", "Asociación", "Región"])
+if dff.empty:
+    st.warning("Los filtros no dejan ningún dato.")
+    st.stop()
 
-# ---------- 1. Resumen ----------
-with tabs[0]:
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Filas", f"{len(df):,}")
-    c2.metric("Columnas", df_full.shape[1])
-    c3.metric("Población representada", f"{int(df['PONDERA'].sum()):,}")
-    st.subheader("% de nulos por variable")
-    nulos = (df_full.isna().mean() * 100).round(2).rename("% nulos").sort_values(ascending=False)
-    st.dataframe(nulos, use_container_width=True)
-    st.download_button("Descargar dataset limpio (CSV)",
-                       df_full.to_csv(index=False).encode("utf-8"),
-                       "eph_limpio.csv", "text/csv")
+# ---------- Tabs ----------
+t1, t2, t3, t4, t5, t6 = st.tabs(
+    ["Resumen", "Precios", "Edad", "Región", "Coberturas", "Datos"]
+)
 
-# ---------- 2. Variable respuesta ----------
-with tabs[1]:
-    st.subheader("Distribución de la cobertura de salud (CH08)")
-    dist = (df.groupby("COBERTURA")["_w"].sum() / df["_w"].sum() * 100).sort_values()
-    fig = px.bar(dist, orientation="h", labels={"value": "%", "COBERTURA": ""})
-    fig.update_layout(showlegend=False)
-    st.plotly_chart(fig, use_container_width=True)
+with t1:
+    c = st.columns(5)
+    c[0].metric("Filas", f"{len(dff):,}")
+    c[1].metric("Planes", dff["plan_id"].nunique())
+    c[2].metric("Prestadoras", dff["nombre_comercial"].nunique())
+    c[3].metric("Regiones", dff["region"].nunique())
+    c[4].metric("Mediana valor cápita", f"${dff['valor_capital'].median():,.0f}")
 
-# ---------- 3. Numéricas ----------
-with tabs[2]:
-    var = st.selectbox("Variable numérica", NUMERICAS)
-    sub = df.dropna(subset=[var])
-    es_ingreso = var in ("IPCF", "P47T")
-    if es_ingreso:
-        sub = sub[sub[var] > 0]
-        usar_log = st.checkbox("Escala logarítmica", value=True)
-    else:
-        usar_log = False
-    col1, col2 = st.columns(2)
-    fig_h = px.histogram(sub, x=var, y="_w", histfunc="sum", nbins=50,
-                         log_x=usar_log, labels={"_w": "Personas"})
-    col1.plotly_chart(fig_h, use_container_width=True)
-    fig_b = px.box(sub.dropna(subset=["COBERTURA"]), x="COBERTURA", y=var, log_y=usar_log)
-    col2.plotly_chart(fig_b, use_container_width=True)
-    st.caption("El boxplot no está ponderado. Se excluyen ingresos = 0 para poder usar escala log.")
+    l, r = st.columns(2)
+    filas = dff["nombre_comercial"].value_counts().reset_index()
+    filas.columns = ["prestadora", "filas"]
+    l.plotly_chart(
+        px.bar(filas, x="prestadora", y="filas", title="Filas por prestadora"),
+        width="stretch",
+    )
+    cap = dff.groupby("nombre_comercial")["cantidad_capitas"].sum().reset_index()
+    r.plotly_chart(
+        px.bar(cap, x="nombre_comercial", y="cantidad_capitas",
+               title="Cápitas totales por prestadora"),
+        width="stretch",
+    )
+    st.subheader("Estadísticos descriptivos")
+    num = ["valor_capital", "cantidad_capitas", "rango_etario_desde",
+           "rango_etario_hasta", "medicamentos_pct"]
+    st.dataframe(dff[num].describe().T, width="stretch")
 
-# ---------- 4. Categóricas vs Y ----------
-with tabs[3]:
-    var = st.selectbox("Variable categórica", CATEGORICAS)
-    tabla = df.dropna(subset=[var, "COBERTURA"]).pivot_table(
-        index=var, columns="COBERTURA", values="_w", aggfunc="sum", fill_value=0)
-    pct = tabla.div(tabla.sum(axis=1), axis=0) * 100
-    largo = pct.reset_index().melt(id_vars=var, var_name="COBERTURA", value_name="%")
-    largo[var] = largo[var].astype(str)
-    fig = px.bar(largo, x=var, y="%", color="COBERTURA", barmode="stack")
-    st.plotly_chart(fig, use_container_width=True, key="cat_vs_y")
-    with st.expander("Ver tabla"):
-        st.dataframe(pct.round(1))
+with t2:
+    l, r = st.columns(2)
+    l.plotly_chart(
+        px.histogram(dff, x="valor_capital", nbins=50, marginal="box",
+                     log_y=log_y, title="Distribución del valor cápita"),
+        width="stretch",
+    )
+    r.plotly_chart(
+        px.box(dff, x="nombre_comercial", y="valor_capital", log_y=log_y,
+               title="Valor cápita por prestadora"),
+        width="stretch",
+    )
+    col = st.selectbox(
+        "Valor cápita según…",
+        ["modalidad_adhesion", "permite_copago", "habitacion_individual",
+         "optica_adultos", "medicamentos_pct"],
+    )
+    st.plotly_chart(
+        px.box(dff, x=dff[col].astype(str), y="valor_capital", log_y=log_y,
+               labels={"x": col}),
+        width="stretch",
+    )
 
-# ---------- 5. Asociación ----------
-def cramers_v(x, y):
-    t = pd.crosstab(x, y)
-    k = min(t.shape) - 1
-    if k <= 0:
-        return np.nan
-    return np.sqrt(chi2_contingency(t)[0] / (t.values.sum() * k))
+with t3:
+    st.caption("Edad media = punto medio del rango etario (desde–hasta).")
+    color = st.selectbox("Color", [None, "nombre_comercial", "modalidad_adhesion"])
+    st.plotly_chart(
+        px.scatter(dff, x="edad_media", y="valor_capital", color=color,
+                   opacity=0.5, log_y=log_y,
+                   title="Valor cápita vs. edad"),
+        width="stretch",
+    )
+    med = (dff.groupby(["edad_media", "nombre_comercial"])["valor_capital"]
+              .median().reset_index())
+    st.plotly_chart(
+        px.line(med, x="edad_media", y="valor_capital", color="nombre_comercial",
+                markers=True, log_y=log_y,
+                title="Mediana del valor cápita por edad y prestadora"),
+        width="stretch",
+    )
 
-with tabs[4]:
-    st.subheader("Categóricas vs CH08: V de Cramér")
-    res = {v: cramers_v(df[v], df["CH08"]) for v in CATEGORICAS if df[v].nunique() > 1}
-    cv = pd.Series(res, name="V de Cramér").sort_values(ascending=False)
-    st.plotly_chart(px.bar(cv, orientation="h"), use_container_width=True)
-    st.caption("Calculado sobre la muestra (sin ponderar). 0 = sin asociación, 1 = asociación perfecta.")
+with t4:
+    top = st.slider("Top regiones (por cantidad de filas)", 5, 52, 15)
+    reg = (dff.groupby("region")["valor_capital"]
+              .agg(mediana="median", filas="size").reset_index()
+              .sort_values("filas", ascending=False).head(top)
+              .sort_values("mediana"))
+    st.plotly_chart(
+        px.bar(reg, x="mediana", y="region", orientation="h", hover_data=["filas"],
+               title="Mediana del valor cápita por región"),
+        width="stretch",
+    )
 
-    st.subheader("Correlación entre numéricas (Spearman)")
-    corr = df[NUMERICAS].corr(method="spearman")
-    st.plotly_chart(px.imshow(corr, text_auto=".2f", color_continuous_scale="RdBu_r",
-                              zmin=-1, zmax=1), use_container_width=True)
+with t5:
+    cat = ["ortodoncia", "cirugia_estetica", "cobertura_viaje", "kinesiologia",
+           "psicologia", "cobertura_fallecimiento", "protesis_dental",
+           "blanqueamiento_dental", "medico_domicilio", "gym", "telemedicina",
+           "fonoaudiologia", "practicas_especiales", "cirugia_refractiva"]
+    cat = [c for c in cat if c in dff.columns]
+    var = st.selectbox("Cobertura", cat)
+    l, r = st.columns(2)
+    vc = dff[var].astype(str).value_counts().reset_index()
+    vc.columns = [var, "filas"]
+    l.plotly_chart(px.bar(vc, x=var, y="filas", title=f"Frecuencia de {var}"),
+                   width="stretch")
+    r.plotly_chart(
+        px.box(dff, x=dff[var].astype(str), y="valor_capital", log_y=log_y,
+               labels={"x": var}, title=f"Valor cápita según {var}"),
+        width="stretch",
+    )
+    st.subheader("Cobertura por prestadora (% de filas)")
+    ct = pd.crosstab(dff["nombre_comercial"], dff[var].astype(str), normalize="index") * 100
+    st.plotly_chart(
+        px.imshow(ct.round(1), text_auto=True, color_continuous_scale="Blues",
+                  aspect="auto"),
+        width="stretch",
+    )
 
-# ---------- 6. Región ----------
-with tabs[5]:
-    st.subheader("Cobertura de salud por región")
-    tabla = df.dropna(subset=["REGION", "COBERTURA"]).pivot_table(
-        index="REGION", columns="COBERTURA", values="_w", aggfunc="sum", fill_value=0)
-    pct = tabla.div(tabla.sum(axis=1), axis=0) * 100
-    largo = pct.reset_index().melt(id_vars="REGION", var_name="COBERTURA", value_name="%")
-    st.plotly_chart(px.bar(largo, x="REGION", y="%", color="COBERTURA", barmode="stack"),
-                    use_container_width=True, key="region")
-    st.dataframe(pct.round(1))
+with t6:
+    st.dataframe(dff, width="stretch")
+    st.download_button("Descargar filtrado (CSV)",
+                       dff.to_csv(index=False).encode("utf-8"),
+                       "base_filtrada.csv", "text/csv")
